@@ -20,6 +20,7 @@ import {
 } from '../di-extractors/index.js';
 import { isDev } from '../utils/env.js';
 import { logger } from '../../logger.js';
+import { normalizeQualifiedName } from '../utils/qualified-name.js';
 
 export interface DIOutput {
   injectsEdges: number;
@@ -75,10 +76,16 @@ function emptyNameIndex(): NameIndex {
 function addIndexedName(index: NameIndex, node: GraphNode): void {
   const qualifiedName = node.properties.qualifiedName;
   if (typeof qualifiedName === 'string') {
-    index.byQualifiedName.set(
-      qualifiedName,
-      index.byQualifiedName.has(qualifiedName) ? AMBIGUOUS : node.id,
-    );
+    const keys = new Set([qualifiedName, normalizeQualifiedName(qualifiedName)]);
+    for (const key of keys) {
+      if (key.length === 0) continue;
+      const existing = index.byQualifiedName.get(key);
+      if (existing === undefined) {
+        index.byQualifiedName.set(key, node.id);
+      } else if (existing !== node.id) {
+        index.byQualifiedName.set(key, AMBIGUOUS);
+      }
+    }
   }
   const simpleName = node.properties.name;
   index.bySimpleName.set(simpleName, index.bySimpleName.has(simpleName) ? AMBIGUOUS : node.id);
@@ -95,13 +102,14 @@ function resolveIndexedName(
 ): string | typeof AMBIGUOUS | undefined {
   if (index === undefined) return undefined;
   const map = isQualifiedTypeName(name) ? index.byQualifiedName : index.bySimpleName;
-  const exact = map.get(name);
+  const exact = map.get(name) ?? (isQualifiedTypeName(name) ? map.get(normalizeQualifiedName(name)) : undefined);
   if (exact !== undefined || options?.caseInsensitive !== true) return exact;
 
-  const needle = name.toLowerCase();
+  const needles = new Set([name.toLowerCase(), normalizeQualifiedName(name).toLowerCase()]);
   let found: string | typeof AMBIGUOUS | undefined;
   for (const [key, id] of map) {
-    if (key.toLowerCase() !== needle) continue;
+    const keyNorm = normalizeQualifiedName(key).toLowerCase();
+    if (!needles.has(key.toLowerCase()) && !needles.has(keyNorm)) continue;
     if (found === undefined) {
       found = id;
       continue;
@@ -115,10 +123,15 @@ function lookupPreferenceByType(
   byType: Readonly<Record<string, string>>,
   typeName: string,
 ): string | undefined {
-  const exact = byType[typeName];
+  const exact = byType[typeName] ?? byType[normalizeQualifiedName(typeName)];
   if (exact !== undefined) return exact;
-  const lower = typeName.toLowerCase();
-  return Object.entries(byType).find(([key]) => key.toLowerCase() === lower)?.[1];
+  const needles = new Set([typeName.toLowerCase(), normalizeQualifiedName(typeName).toLowerCase()]);
+  for (const [key, reason] of Object.entries(byType)) {
+    if (needles.has(key.toLowerCase()) || needles.has(normalizeQualifiedName(key).toLowerCase())) {
+      return reason;
+    }
+  }
+  return undefined;
 }
 
 /**

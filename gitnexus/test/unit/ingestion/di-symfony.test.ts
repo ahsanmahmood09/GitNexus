@@ -91,16 +91,18 @@ function stampSymfonyProvider(
 }
 
 describe('normalizeSymfonyInjectionType', () => {
-  it('accepts class / interface names and FQCNs', () => {
+  it('accepts class / interface names and FQCNs in both forms', () => {
     expect(normalizeSymfonyInjectionType('Logger')).toBe('Logger');
-    expect(normalizeSymfonyInjectionType('\\App\\Log\\Logger')).toBe('App\\Log\\Logger');
+    expect(normalizeSymfonyInjectionType('\\App\\Log\\Logger')).toBe('App.Log.Logger');
+    expect(normalizeSymfonyInjectionType('App.Log.Logger')).toBe('App.Log.Logger');
     expect(normalizeSymfonyInjectionType('?FileLogger')).toBe('FileLogger');
   });
 
-  it('rejects scalars and unions', () => {
+  it('peels nullable unions; rejects scalars / multi-class unions', () => {
     expect(normalizeSymfonyInjectionType('string')).toBeNull();
     expect(normalizeSymfonyInjectionType('array')).toBeNull();
-    expect(normalizeSymfonyInjectionType('Logger|null')).toBeNull();
+    expect(normalizeSymfonyInjectionType('Logger|null')).toBe('Logger');
+    expect(normalizeSymfonyInjectionType('Logger|Clock')).toBeNull();
   });
 });
 
@@ -124,13 +126,17 @@ describe('matchSymfonyConstructorInjections', () => {
 });
 
 describe('isServicesYaml', () => {
-  it('accepts main, env-suffixed, and services/ import paths', () => {
+  it('accepts base and services/ import paths', () => {
     expect(isServicesYaml('config/services.yaml')).toBe(true);
     expect(isServicesYaml('config/services.yml')).toBe(true);
-    expect(isServicesYaml('config/services_dev.yaml')).toBe(true);
-    expect(isServicesYaml('config/services_test.yaml')).toBe(true);
-    expect(isServicesYaml('apps/api/config/services_prod.yaml')).toBe(true);
     expect(isServicesYaml('config/services/messenger.yaml')).toBe(true);
+  });
+
+  it('scopes env-suffixed paths to the selected environment', () => {
+    expect(isServicesYaml('config/services_dev.yaml')).toBe(false);
+    expect(isServicesYaml('config/services_dev.yaml', 'dev')).toBe(true);
+    expect(isServicesYaml('config/services_test.yaml', 'dev')).toBe(false);
+    expect(isServicesYaml('apps/api/config/services_prod.yaml', 'prod')).toBe(true);
   });
 
   it('rejects unrelated yaml paths', () => {
@@ -141,10 +147,11 @@ describe('isServicesYaml', () => {
 });
 
 describe('classMatchesName', () => {
-  it('matches FQCN aliases only against the same qualifiedName', () => {
+  it('matches FQCN aliases across backslash and dotted qualifiedNames', () => {
     expect(classMatchesName('FileLogger', 'App\\Log\\FileLogger', 'App\\Log\\FileLogger')).toBe(
       true,
     );
+    expect(classMatchesName('FileLogger', 'App.Log.FileLogger', 'App\\Log\\FileLogger')).toBe(true);
     expect(classMatchesName('FileLogger', 'Other\\FileLogger', 'App\\Log\\FileLogger')).toBe(false);
   });
 
@@ -580,5 +587,104 @@ services:
     );
     const preferred = injects.filter((e) => e.targetId === fileLoggerId && e.confidence >= 0.9);
     expect(preferred).toHaveLength(0);
+  });
+
+  it('resolves YAML backslash aliases against dotted PHP graph FQNs + nullable unions', async () => {
+    const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), 'symfony-dot-fqn-'));
+    await fs.mkdir(path.join(repoPath, 'config'), { recursive: true });
+    await fs.writeFile(
+      path.join(repoPath, 'config', 'services.yaml'),
+      `
+services:
+  App\\Log\\Logger: '@App\\Log\\FileLogger'
+`,
+      'utf8',
+    );
+
+    const graph = createKnowledgeGraph();
+    const orderId = addNode(graph, 'Class', 'OrderService', {
+      qualifiedName: 'App.Service.OrderService',
+    });
+    const loggerId = addNode(graph, 'Interface', 'Logger', {
+      qualifiedName: 'App.Log.Logger',
+    });
+    const fileLoggerId = addNode(graph, 'Class', 'FileLogger', {
+      qualifiedName: 'App.Log.FileLogger',
+    });
+    const syslogId = addNode(graph, 'Class', 'SyslogLogger', {
+      qualifiedName: 'App.Log.SyslogLogger',
+    });
+    addImplements(graph, fileLoggerId, loggerId);
+    addImplements(graph, syslogId, loggerId);
+
+    const ctorId = addNode(graph, 'Method', 'OrderService.__construct', {
+      name: '__construct',
+      parameterTypes: ['\\App\\Log\\Logger|null'],
+      parameterCount: 1,
+      filePath: 'src/OrderService.php',
+    });
+    addHasMethod(graph, orderId, ctorId);
+
+    const deps = new Map<string, PhaseResult<unknown>>([
+      [
+        'parse',
+        {
+          phaseName: 'parse',
+          output: { allPaths: ['config/services.yaml'] },
+          durationMs: 0,
+        },
+      ],
+    ]);
+
+    expect((await symfonyConfigPhase.execute(makeCtx(graph, repoPath), deps)).aliasesApplied).toBe(
+      1,
+    );
+    await diPhase.execute(makeCtx(graph, repoPath), new Map());
+    const injects = [...graph.iterRelationshipsByType('INJECTS')].filter(
+      (e) => e.sourceId === orderId,
+    );
+    expect(injects.some((e) => e.targetId === fileLoggerId && e.confidence >= 0.9)).toBe(true);
+    expect(injects.some((e) => e.targetId === syslogId && e.confidence >= 0.9)).toBe(false);
+
+    await fs.rm(repoPath, { recursive: true, force: true });
+  });
+
+  it('ignores services_dev.yaml unless symfonyEnv=dev', async () => {
+    const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), 'symfony-env-'));
+    await fs.mkdir(path.join(repoPath, 'config'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, 'config', 'services.yaml'), 'services: {}\n', 'utf8');
+    await fs.writeFile(
+      path.join(repoPath, 'config', 'services_dev.yaml'),
+      `
+services:
+  App\\Log\\Logger: '@App\\Log\\FileLogger'
+`,
+      'utf8',
+    );
+
+    const graph = createKnowledgeGraph();
+    addNode(graph, 'Class', 'FileLogger', { qualifiedName: 'App.Log.FileLogger' });
+    const deps = new Map<string, PhaseResult<unknown>>([
+      [
+        'parse',
+        {
+          phaseName: 'parse',
+          output: { allPaths: ['config/services.yaml', 'config/services_dev.yaml'] },
+          durationMs: 0,
+        },
+      ],
+    ]);
+
+    expect((await symfonyConfigPhase.execute(makeCtx(graph, repoPath), deps)).aliasesFound).toBe(0);
+    expect(
+      (
+        await symfonyConfigPhase.execute(
+          { ...makeCtx(graph, repoPath), options: { symfonyEnv: 'dev' } },
+          deps,
+        )
+      ).aliasesFound,
+    ).toBe(1);
+
+    await fs.rm(repoPath, { recursive: true, force: true });
   });
 });

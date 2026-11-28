@@ -22,6 +22,7 @@ import {
   SYMFONY_DI_PROVIDER_PROPERTY,
   defaultSymfonyProvider,
 } from '../di-extractors/symfony.js';
+import { normalizeQualifiedName } from '../utils/qualified-name.js';
 
 const require = createRequire(import.meta.url);
 const yaml = require('js-yaml') as typeof import('js-yaml');
@@ -77,9 +78,13 @@ export interface SymfonyServiceAlias {
   filePath: string;
 }
 
-const SERVICES_YAML_RE = /(?:^|\/)config\/services(?:_[a-zA-Z0-9]+)?(?:\/[^/]+)?\.ya?ml$/i;
-const SERVICES_PHP_RE = /(?:^|\/)config\/services(?:_[a-zA-Z0-9]+)?\.php$/i;
-const SERVICES_XML_RE = /(?:^|\/)config\/services(?:_[a-zA-Z0-9]+)?\.xml$/i;
+const SERVICES_BASE_YAML_RE = /(?:^|\/)config\/services\.ya?ml$/i;
+const SERVICES_DIR_YAML_RE = /(?:^|\/)config\/services\/[^/]+\.ya?ml$/i;
+const SERVICES_ENV_YAML_RE = /(?:^|\/)config\/services_([a-zA-Z0-9]+)\.ya?ml$/i;
+const SERVICES_BASE_PHP_RE = /(?:^|\/)config\/services\.php$/i;
+const SERVICES_BASE_XML_RE = /(?:^|\/)config\/services\.xml$/i;
+const SERVICES_ENV_PHP_RE = /(?:^|\/)config\/services_([a-zA-Z0-9]+)\.php$/i;
+const SERVICES_ENV_XML_RE = /(?:^|\/)config\/services_([a-zA-Z0-9]+)\.xml$/i;
 
 const SYMFONY_COMPOSER_PACKAGES: ReadonlySet<string> = new Set([
   'symfony/framework-bundle',
@@ -87,14 +92,33 @@ const SYMFONY_COMPOSER_PACKAGES: ReadonlySet<string> = new Set([
   'symfony/runtime',
 ]);
 
-export function isServicesYaml(filePath: string): boolean {
-  const normalized = filePath.replace(/\\/g, '/');
-  return SERVICES_YAML_RE.test(normalized);
+function matchesSelectedEnv(fileEnv: string, selectedEnv: string | undefined): boolean {
+  return (
+    selectedEnv !== undefined &&
+    selectedEnv.length > 0 &&
+    fileEnv.toLowerCase() === selectedEnv.toLowerCase()
+  );
 }
 
-export function isServicesPhpOrXml(filePath: string): boolean {
+/** Base + `config/services/**` always; `services_{env}.*` only when env matches. */
+export function isServicesYaml(filePath: string, env?: string): boolean {
   const normalized = filePath.replace(/\\/g, '/');
-  return SERVICES_PHP_RE.test(normalized) || SERVICES_XML_RE.test(normalized);
+  if (SERVICES_BASE_YAML_RE.test(normalized) || SERVICES_DIR_YAML_RE.test(normalized)) {
+    return true;
+  }
+  const match = SERVICES_ENV_YAML_RE.exec(normalized);
+  return match !== null && matchesSelectedEnv(match[1], env);
+}
+
+export function isServicesPhpOrXml(filePath: string, env?: string): boolean {
+  const normalized = filePath.replace(/\\/g, '/');
+  if (SERVICES_BASE_PHP_RE.test(normalized) || SERVICES_BASE_XML_RE.test(normalized)) {
+    return true;
+  }
+  const phpMatch = SERVICES_ENV_PHP_RE.exec(normalized);
+  if (phpMatch !== null) return matchesSelectedEnv(phpMatch[1], env);
+  const xmlMatch = SERVICES_ENV_XML_RE.exec(normalized);
+  return xmlMatch !== null && matchesSelectedEnv(xmlMatch[1], env);
 }
 
 function stripServiceId(raw: string): string {
@@ -104,9 +128,13 @@ function stripServiceId(raw: string): string {
   return id;
 }
 
+function typeKey(raw: string): string {
+  return normalizeQualifiedName(stripServiceId(raw));
+}
+
 function simpleName(fqcn: string): string {
-  const cleaned = stripServiceId(fqcn);
-  const idx = cleaned.lastIndexOf('\\');
+  const cleaned = typeKey(fqcn);
+  const idx = cleaned.lastIndexOf('.');
   return idx === -1 ? cleaned : cleaned.slice(idx + 1);
 }
 
@@ -218,14 +246,14 @@ export function classMatchesName(
   qualifiedName: unknown,
   wanted: string,
 ): boolean {
-  const target = stripServiceId(wanted);
-  const targetSimple = simpleName(target);
-  const wantedIsFqcn = target.includes('\\');
+  const target = typeKey(wanted);
+  const targetSimple = simpleName(wanted);
+  const wantedIsFqcn = target.includes('.');
 
   if (typeof qualifiedName === 'string' && qualifiedName.length > 0) {
-    const q = stripServiceId(qualifiedName);
+    const q = typeKey(qualifiedName);
     if (namesEqual(q, target)) return true;
-    if (!wantedIsFqcn && namesEqual(simpleName(q), target)) return true;
+    if (!wantedIsFqcn && namesEqual(simpleName(qualifiedName), target)) return true;
     return false;
   }
 
@@ -235,10 +263,11 @@ export function classMatchesName(
 async function collectServiceYamlPaths(
   repoPath: string,
   allPaths: readonly string[],
+  env?: string,
 ): Promise<string[]> {
   // Only paths admitted by the repository scan (honours ignore rules / size caps).
   const existing: string[] = [];
-  for (const rel of allPaths.filter(isServicesYaml)) {
+  for (const rel of allPaths.filter((p) => isServicesYaml(p, env))) {
     const filePath = path.isAbsolute(rel) ? rel : path.join(repoPath, rel);
     try {
       const stat = await fs.stat(filePath);
@@ -276,9 +305,10 @@ async function hasSymfonyContainerEvidence(
   repoPath: string,
   allPaths: readonly string[],
   yamlPaths: readonly string[],
+  env?: string,
 ): Promise<boolean> {
   if (yamlPaths.length > 0) return true;
-  if (allPaths.some(isServicesPhpOrXml)) return true;
+  if (allPaths.some((p) => isServicesPhpOrXml(p, env))) return true;
   return composerRequiresSymfony(repoPath);
 }
 
@@ -322,9 +352,15 @@ export const symfonyConfigPhase: PipelinePhase<SymfonyConfigOutput> = {
   ): Promise<SymfonyConfigOutput> {
     const parseOutput = getPhaseOutput<ParseOutput>(deps, 'parse');
     const allPaths = parseOutput.allPaths ?? [];
-    const yamlPaths = await collectServiceYamlPaths(ctx.repoPath, allPaths);
+    const symfonyEnv = ctx.options?.symfonyEnv;
+    const yamlPaths = await collectServiceYamlPaths(ctx.repoPath, allPaths, symfonyEnv);
 
-    const enableDi = await hasSymfonyContainerEvidence(ctx.repoPath, allPaths, yamlPaths);
+    const enableDi = await hasSymfonyContainerEvidence(
+      ctx.repoPath,
+      allPaths,
+      yamlPaths,
+      symfonyEnv,
+    );
     if (!enableDi) {
       return { aliasesApplied: 0, aliasesFound: 0 };
     }
@@ -376,6 +412,8 @@ export const symfonyConfigPhase: PipelinePhase<SymfonyConfigOutput> = {
       const reason = `Symfony services.yaml alias ${alias.interfaceName} → ${implementationName}`;
       const preferenceByType = readPriorPreferenceByType(node);
       preferenceByType[alias.interfaceName] = reason;
+      const canonical = typeKey(alias.interfaceName);
+      if (canonical.length > 0) preferenceByType[canonical] = reason;
 
       node.properties[SYMFONY_DI_PROVIDER_PROPERTY] = {
         ...base,

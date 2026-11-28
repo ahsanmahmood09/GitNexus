@@ -169,7 +169,9 @@ function extractPhpParameters(node: SyntaxNode): ParameterInfo[] {
       const nameNode = param.childForFieldName('name');
       if (!nameNode) continue;
       const typeNode = param.childForFieldName('type');
-      const typeName = typeNode ? (extractSimpleTypeName(typeNode) ?? typeNode.text?.trim()) : null;
+      // Prefer full AST text so FQCNs / nullable unions reach Symfony DI.
+      const rawType = typeNode?.text?.trim() ?? null;
+      const typeName = rawType ?? (typeNode ? extractSimpleTypeName(typeNode) : null) ?? null;
 
       // Detect optional: '=' token among children indicates a default value
       let isOptional = false;
@@ -183,8 +185,8 @@ function extractPhpParameters(node: SyntaxNode): ParameterInfo[] {
 
       params.push({
         name: stripDollar(nameNode.text),
-        type: typeName ?? null,
-        rawType: typeNode?.text?.trim() ?? null,
+        type: typeName,
+        rawType,
         isOptional,
         isVariadic: false,
       });
@@ -192,12 +194,13 @@ function extractPhpParameters(node: SyntaxNode): ParameterInfo[] {
       const nameNode = param.childForFieldName('name');
       if (!nameNode) continue;
       const typeNode = param.childForFieldName('type');
-      const typeName = typeNode ? (extractSimpleTypeName(typeNode) ?? typeNode.text?.trim()) : null;
+      const rawType = typeNode?.text?.trim() ?? null;
+      const typeName = rawType ?? (typeNode ? extractSimpleTypeName(typeNode) : null) ?? null;
 
       params.push({
         name: stripDollar(nameNode.text),
-        type: typeName ?? null,
-        rawType: typeNode?.text?.trim() ?? null,
+        type: typeName,
+        rawType,
         isOptional: false,
         isVariadic: true,
       });
@@ -205,7 +208,8 @@ function extractPhpParameters(node: SyntaxNode): ParameterInfo[] {
       const nameNode = param.childForFieldName('name');
       if (!nameNode) continue;
       const typeNode = param.childForFieldName('type');
-      const typeName = typeNode ? (extractSimpleTypeName(typeNode) ?? typeNode.text?.trim()) : null;
+      const rawType = typeNode?.text?.trim() ?? null;
+      const typeName = rawType ?? (typeNode ? extractSimpleTypeName(typeNode) : null) ?? null;
 
       // Detect variadic: an ERROR child containing "..." indicates variadic promotion
       let isVariadic = false;
@@ -219,8 +223,8 @@ function extractPhpParameters(node: SyntaxNode): ParameterInfo[] {
 
       params.push({
         name: stripDollar(nameNode.text),
-        type: typeName ?? null,
-        rawType: typeNode?.text?.trim() ?? null,
+        type: typeName,
+        rawType,
         isOptional: false,
         isVariadic,
       });

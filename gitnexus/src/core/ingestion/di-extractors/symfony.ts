@@ -23,6 +23,7 @@
 
 import type { GraphNode } from 'gitnexus-shared';
 import type { DiInjectionMatch, DiProviderMatch, DiResolver } from './types.js';
+import { normalizeQualifiedName } from '../utils/qualified-name.js';
 
 export const SYMFONY_DI_PROVIDER_PROPERTY = 'symfonyDiProvider';
 export const SYMFONY_DI_CONSTRUCTOR_ENABLED_PROPERTY = 'symfonyDiConstructorEnabled';
@@ -70,21 +71,26 @@ function isProviderMatch(value: unknown): value is DiProviderMatch {
 
 /**
  * Normalize a PHP parameter type into a DI target name.
- * Strips nullability (`?Foo`), leading `\`, and rejects scalars / unions.
+ * Peels `?T` / `T|null`, accepts `\` or `.` FQCNs, returns graph-canonical dots.
  */
 export function normalizeSymfonyInjectionType(raw: string): string | null {
   let type = raw.replace(/\s+/g, '').trim();
   if (type.length === 0) return null;
-  // Unions / intersections are not a single injectible service type.
-  if (type.includes('|') || type.includes('&')) return null;
+  if (type.includes('&')) return null;
+  if (type.includes('|')) {
+    const parts = type.split('|').filter((p) => p.length > 0 && p.toLowerCase() !== 'null');
+    if (parts.length !== 1) return null;
+    type = parts[0];
+  }
   if (type.startsWith('?')) type = type.slice(1);
-  if (type.startsWith('\\')) type = type.slice(1);
-  if (type.length === 0) return null;
-  const simple = type.includes('\\') ? type.slice(type.lastIndexOf('\\') + 1) : type;
+  const normalized = normalizeQualifiedName(type);
+  if (normalized.length === 0) return null;
+  const simple = normalized.includes('.')
+    ? normalized.slice(normalized.lastIndexOf('.') + 1)
+    : normalized;
   if (PHP_NON_SERVICE_TYPES.has(simple.toLowerCase())) return null;
-  // Require a plausible class/interface name (allows FQCN with backslashes).
-  if (!/^[A-Za-z_][A-Za-z0-9_\\]*$/.test(type)) return null;
-  return type;
+  if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(normalized)) return null;
+  return normalized;
 }
 
 /**
@@ -117,14 +123,22 @@ export function defaultSymfonyProvider(node: GraphNode): DiProviderMatch | null 
   if (node.properties.isAbstract === true) return null;
   const name = node.properties.name;
   if (typeof name !== 'string' || name.length === 0) return null;
-  const names = [name];
+  const names = new Set<string>([name]);
   const qualifiedName = node.properties.qualifiedName;
+  let providedTypeName = name;
   if (typeof qualifiedName === 'string' && qualifiedName.length > 0) {
-    names.push(qualifiedName);
+    names.add(qualifiedName);
+    const normalized = normalizeQualifiedName(qualifiedName);
+    if (normalized.length > 0) {
+      names.add(normalized);
+      providedTypeName = normalized;
+    } else {
+      providedTypeName = qualifiedName;
+    }
   }
   return {
-    names,
-    providedTypeName: typeof qualifiedName === 'string' ? qualifiedName : name,
+    names: [...names],
+    providedTypeName,
     declaredByNodeId: node.id,
   };
 }

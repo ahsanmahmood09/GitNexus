@@ -97,6 +97,11 @@ export interface PipelineOptions {
    * opt-in rather than on.
    */
   asyncApiSpecPath?: string;
+  /**
+   * Symfony env for `config/services_{env}.yaml` aliases. Undefined skips
+   * env-suffixed service files (base `services.yaml` still applies).
+   */
+  symfonyEnv?: string;
   /** Per-advice Spring AOP candidate inspection cap. `0` disables this cap. */
   springAopMaxCandidateInspectionsPerAdvice?: number;
   /** Aggregate Spring AOP candidate inspection cap for one analysis. `0` disables this cap. */
